@@ -30,11 +30,13 @@ struct SM120ArchSpec {
         }
 
         // MN-major B: ldmatrix.trans.x2 handles multi-atom SMEM correctly
-        const int mn_major_b_max_n = 128;
+        const int mn_major_b_max_n = 192;
 
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {
-            if (block_n > 128 or block_n > mn_major_b_max_n)
+            if (block_n != 192)
+                continue;
+            if (block_n > 192 or block_n > mn_major_b_max_n)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
