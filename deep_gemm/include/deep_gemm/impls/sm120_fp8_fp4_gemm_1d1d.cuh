@@ -91,7 +91,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
     static constexpr uint32_t kTMARegisters = 40;
-    static constexpr uint32_t kMMARegisters = 208;
+    static constexpr uint32_t kMMARegisters = 216;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
