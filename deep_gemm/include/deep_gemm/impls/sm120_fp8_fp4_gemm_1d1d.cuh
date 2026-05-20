@@ -200,7 +200,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, kSFKAlignment, 11>(
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment, 11>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
