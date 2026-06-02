@@ -80,7 +80,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
     // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    static constexpr uint32_t kNWarps = 4;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -91,7 +91,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
     static constexpr uint32_t kTMARegisters = 32;
-    static constexpr uint32_t kMMARegisters = 216;
+    static constexpr uint32_t kMMARegisters = 232;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
@@ -200,7 +200,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment, 11>(
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment, 7>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -296,9 +296,6 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
                     if constexpr (kBKMajor) {
                         tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
                     } else {
@@ -306,6 +303,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             tma_b_desc, full_barriers[s], smem_b[s],
                             n_idx, k_idx, 1, batch_idx);
                     }
+                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
                     full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                 }
             }
@@ -320,8 +320,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = math_warp_idx / kNWarps;
-        const uint32_t warp_n = math_warp_idx % kNWarps;
+        const uint32_t warp_m = math_warp_idx % kMWarps;
+        const uint32_t warp_n = math_warp_idx / kMWarps;
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
@@ -350,7 +350,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
                 // Per-N-tile x4 B load: one ldmatrix.x4 per N-tile covers 2 K-steps.
                 // Output {r0,r1} = K-step 0, {r2,r3} = K-step 1 — consecutive regs, zero MOV.
-                static constexpr bool kUsePerNTileX4 = kBKMajor and not kBIsFP4 and (kKSteps >= 2);
+                static constexpr bool kUsePerNTileX4 = false;
 
                 using sf_t = cute::conditional_t<kIsFP4, uint16_t, uint8_t>;
                 const uint32_t sf_byte_a_base = (kb * BLOCK_K / kGranKA) % 4;

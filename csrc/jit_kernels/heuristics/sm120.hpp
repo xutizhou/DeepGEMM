@@ -17,7 +17,7 @@ struct SM120ArchSpec {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
         // SM120a always uses warp-specialized pipeline: BM=128, BK=128/elem_size
-        const int block_m = 128;
+        const int block_m = 192;
         const int block_k = 128 / elem_size;
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
@@ -34,9 +34,9 @@ struct SM120ArchSpec {
 
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {
-            if (block_n != 192)
+            if (block_n != 128)
                 continue;
-            if (block_n > 192 or block_n > mn_major_b_max_n)
+            if (block_n > 192)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
@@ -106,7 +106,7 @@ struct SM120ArchSpec {
 
         int store_m = layout.block_m;
         constexpr int kSubTileM = 64;
-        if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
+        if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM and layout.block_m % kSubTileM == 0) {
             const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
             const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
             if (stages_sub > stages_full)
