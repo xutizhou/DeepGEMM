@@ -106,17 +106,16 @@ This targets:
 - A/B: FP4 with UE8M0 scales, `gran_k=32`
 - output: BF16
 
-Current DGX Spark GitHub baseline at commit `8c4c503`:
+Current DGX Spark GitHub baseline at commit `8fbf0ec`:
 
 ```text
-G1 run a: m=36096, n=6144, k=7168, median=8147.0 us,
-throughput=390.2 TFLOP/s, diff_vs_ref=0.01338
-G1 run b: median=8244.0 us, throughput=385.7 TFLOP/s
-G1 run c: median=8132.0 us, throughput=391.0 TFLOP/s
+G1 run a: m=36096, n=6144, k=7168, median=8290.0 us,
+throughput=383.5 TFLOP/s, diff_vs_ref=0.01338
+G1 run b: median=8130.0 us, throughput=391.1 TFLOP/s
 ```
 
-The G2 accepted baseline at the same commit is 574.7-584.8 us,
-309.4-314.8 TFLOP/s, diff_vs_ref=0.01341.
+The G2 accepted baseline at the same commit is 577.3-592.5 us,
+305.4-313.4 TFLOP/s, diff_vs_ref=0.01341.
 
 ## DGX Spark / SM121
 

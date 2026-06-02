@@ -8,7 +8,7 @@ Target platform:
 ```text
 DGX Spark / GB10 / SM121 / 48 SMs
 DeepGEMM branch: codex/mgroup-fp4-g1-opt
-Starting commit: 8c4c503
+Starting commit: 8fbf0ec
 ```
 
 Use the actual DeepGEMM source first, then read the CUDA knowledge bundle on
@@ -101,11 +101,11 @@ to check regression.
 
 ## Current Performance Anchor
 
-At commit `8c4c503`:
+At commit `8fbf0ec`:
 
 ```text
-G1: 8132-8244 us, 385.7-391.0 TFLOP/s, diff 0.01338
-G2: 574.7-584.8 us, 309.4-314.8 TFLOP/s, diff 0.01341
+G1: 8130-8290 us, 383.5-391.1 TFLOP/s, diff 0.01338
+G2: 577.3-592.5 us, 305.4-313.4 TFLOP/s, diff 0.01341
 ```
 
 Treat this as the baseline to beat. Do not use the older 68e7d2d clean-base G2

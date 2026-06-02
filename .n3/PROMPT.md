@@ -20,7 +20,7 @@ Secondary target:
 
 The useful code path is the shared SM120/SM121 FP8/FP4 1D1D kernel family. G2
 gets priority, but any accepted G2 improvement must not materially regress G1.
-Start from commit `8c4c503` on branch `codex/mgroup-fp4-g1-opt` in the
+Start from commit `8fbf0ec` on branch `codex/mgroup-fp4-g1-opt` in the
 `xutizhou/DeepGEMM` GitHub checkout.
 
 ## The Problem
@@ -34,12 +34,12 @@ The historical clean GitHub base at `68e7d2d` was:
 diff 0.01341
 ```
 
-The current GitHub baseline / accepted family at `8c4c503` is:
+The current GitHub baseline / accepted family at `8fbf0ec` is:
 
 ```text
-584.8 / 578.0 / 574.7 us
-309.4 / 313.0 / 314.8 TFLOP/s
-206.7 / 209.2 / 210.3 GB/s
+577.3 / 592.5 / 581.7 us
+313.4 / 305.4 / 311.0 TFLOP/s
+209.4 / 204.0 / 207.8 GB/s
 diff 0.01341
 ```
 
@@ -64,7 +64,7 @@ wait, not raw DRAM bandwidth:
 
 Do not run a random parameter sweep. Work from profile evidence.
 
-First re-establish the accepted G2 source at commit `8c4c503` and benchmark in
+First re-establish the accepted G2 source at commit `8fbf0ec` and benchmark in
 the current clock/thermal window. Then inspect accepted NCU/SASS artifacts if
 they exist; if they are absent in a fresh checkout, capture a focused profile
 before making profile-driven changes. Map the dominant wait path back to source
@@ -205,6 +205,8 @@ Focus workers on:
 8. Tail invalid-subtile skip branches; prior runs regressed.
 9. Store48 + skip-first TMA-store wait; positive samples were not stable.
 10. Treating one good run as real.
+11. Applying the BM192/BN128 G2 layout globally. It reproduced G2, but broke G1
+    psum contiguous correctness. Keep G1/G2 split by `GemmType`.
 
 ## Constraints
 

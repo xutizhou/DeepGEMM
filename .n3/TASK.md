@@ -4,7 +4,7 @@
 **Primary target**: G2 masked M-grouped FP4 (`m_grouped_fp8_fp4_gemm_nt_masked`).
 **Secondary target**: G1 contiguous/psum M-grouped FP4 (`m_grouped_fp8_fp4_gemm_nt_contiguous`).
 **Machine**: DGX Spark / GB10 / SM121, 48 SMs.
-**Starting commit**: `8c4c503` on `xutizhou/DeepGEMM`, branch `codex/mgroup-fp4-g1-opt`.
+**Starting commit**: `8fbf0ec` on `xutizhou/DeepGEMM`, branch `codex/mgroup-fp4-g1-opt`.
 
 ## Context
 
@@ -37,12 +37,11 @@ family. G1 and G2 both exercise that family, so a change must be judged by:
 - output: BF16
 - result log: `avo/results.tsv`, `avo/results.jsonl`
 
-Current GitHub baseline at `8c4c503`:
+Current GitHub baseline at `8fbf0ec`:
 
 ```text
-run a: 8147.0 us / 390.2 TFLOP/s / diff 0.01338
-run b: 8244.0 us / 385.7 TFLOP/s / diff 0.01338
-run c: 8132.0 us / 391.0 TFLOP/s / diff 0.01338
+run a: 8290.0 us / 383.5 TFLOP/s / diff 0.01338
+run b: 8130.0 us / 391.1 TFLOP/s / diff 0.01338
 ```
 
 This is about 77-78% of a rough 500 TFLOP/s FP4 peak. G1 target: keep stable
@@ -74,12 +73,12 @@ run b: 624.7 us / 289.6 TFLOP/s / 193.5 GB/s / diff 0.01341
 run c: 631.1 us / 286.7 TFLOP/s / 191.6 GB/s / diff 0.01341
 ```
 
-Current GitHub baseline / accepted band at `8c4c503`:
+Current GitHub baseline / accepted band at `8fbf0ec`:
 
 ```text
-run a: 584.8 us / 309.4 TFLOP/s / 206.7 GB/s / diff 0.01341
-run b: 578.0 us / 313.0 TFLOP/s / 209.2 GB/s / diff 0.01341
-run c: 574.7 us / 314.8 TFLOP/s / 210.3 GB/s / diff 0.01341
+run a: 577.3 us / 313.4 TFLOP/s / 209.4 GB/s / diff 0.01341
+run b: 592.5 us / 305.4 TFLOP/s / 204.0 GB/s / diff 0.01341
+run c: 581.7 us / 311.0 TFLOP/s / 207.8 GB/s / diff 0.01341
 ```
 
 This is about 62-63% of a rough 500 TFLOP/s FP4 peak. The immediate target is a
@@ -121,7 +120,7 @@ barrier-wait profile, then test it.
 
 Priority order:
 
-1. Re-establish the current accepted G2 source at commit `8c4c503` and
+1. Re-establish the current accepted G2 source at commit `8fbf0ec` and
    benchmark in the current clock/thermal window.
 2. Read the accepted SASS/NCU artifacts and map the dominant wait PCs back to
    the source path before editing.
@@ -243,6 +242,10 @@ reference set for AVO runs.
 9. Store48 + skip-first TMA-store wait; positive samples were not stable.
 10. Treating one good run as real. Any accepted improvement needs repeat
     confirmation.
+11. Applying the BM192/BN128 G2 layout globally to G1 psum contiguous. Commit
+    `8c4c503` reproduced G2 around 63%, but G1 full shape failed correctness
+    with diff about 0.02542. Keep the split path: G1 psum uses legacy
+    BM128/BN192 behavior, while G2 masked uses BM192/BN128.
 
 ## Acceptance Rules
 
