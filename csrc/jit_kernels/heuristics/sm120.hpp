@@ -16,8 +16,11 @@ struct SM120ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
-        // SM120a always uses warp-specialized pipeline: BM=128, BK=128/elem_size
-        const int block_m = 192;
+        // G1 psum-contiguous needs the legacy BM128/BN192 shape for correctness.
+        // G2 masked uses the accepted BM192/BN128 layout that reaches ~63%.
+        const bool use_g1_psum_layout = desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const int block_m = use_g1_psum_layout ? 128 : 192;
+        const int target_block_n = use_g1_psum_layout ? 192 : 128;
         const int block_k = 128 / elem_size;
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
@@ -34,7 +37,7 @@ struct SM120ArchSpec {
 
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {
-            if (block_n != 128)
+            if (block_n != target_block_n)
                 continue;
             if (block_n > 192)
                 continue;
