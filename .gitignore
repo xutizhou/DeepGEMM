@@ -6,6 +6,25 @@ dist
 *.egg-info
 *.pyc
 
+# AVO task runtime artifacts. Keep the harness and task markdown tracked, but
+# do not commit benchmark logs, generated traces, or agent scratch state.
+avo/*.jsonl
+avo/*.tsv
+avo/*.log
+avo/*.csv
+avo/*.txt
+avo/*.sass
+avo/*.ncu-rep
+avo/.dg_cache*
+avo/__pycache__/
+avo/ncu/
+avo/remote_sass/
+.n3/memory/
+.n3/tool-docs/
+.n3/task_prompt.md
+.n3/references/
+.n3/cuda-knowledge-sm12x/
+
 # Third-party links created by `setup.py develop`
 deep_gemm/include/cute
 deep_gemm/include/cutlass
