@@ -19,9 +19,11 @@ struct SM120ArchSpec {
         // G1 psum-contiguous needs the legacy BM128/BN192 shape for correctness.
         // G2 masked uses the accepted BM192/BN128 layout that reaches ~63%.
         const bool use_g1_psum_layout = desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
+            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
         const int block_m = use_g1_psum_layout ? 128 : 192;
         const int target_block_n = use_g1_psum_layout ? 192 : 128;
-        const int block_k = 128 / elem_size;
+        const int block_k = use_g2_bk256_scale2_indexfix ? 256 : (128 / elem_size);
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
         std::vector<int> block_n_candidates;
@@ -108,8 +110,13 @@ struct SM120ArchSpec {
         const int stages_full = std::min((smem_capacity - smem_barriers - smem_d_full) / per_stage, kNumMaxStages);
 
         int store_m = layout.block_m;
+        const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
+            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and
+            layout.block_m == 192 and layout.block_n == 128 and layout.block_k == 256;
         constexpr int kSubTileM = 64;
-        if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM and layout.block_m % kSubTileM == 0) {
+        if (use_g2_bk256_scale2_indexfix) {
+            store_m = 32;
+        } else if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM and layout.block_m % kSubTileM == 0) {
             const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
             const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
             if (stages_sub > stages_full)
@@ -140,8 +147,11 @@ struct SM120ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (desc.kernel_type == KernelType::Kernel1D1D) {
-            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128);
-            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128);
+            const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
+                desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and layout.block_k == 256;
+            const int num_sf_stage_rows = use_g2_bk256_scale2_indexfix ? 2 : 1;
+            smem_sfa_per_stage = align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
+            smem_sfb_per_stage = align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128) * num_sf_stage_rows;
         }
 
         const int smem_tensormap =
