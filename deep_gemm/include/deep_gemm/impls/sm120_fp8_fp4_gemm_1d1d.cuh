@@ -72,12 +72,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNumMathThreads % 32 == 0, "Invalid math threads");
     DG_STATIC_ASSERT(BLOCK_M % MMA_M == 0 and BLOCK_N % MMA_N == 0 and BLOCK_K % MMA_K == 0, "Invalid block dims");
 
-    static constexpr bool kUseG2BK256Scale2 = kGemmType == GemmType::MGroupedMasked and kIsFP4 and not kBIsFP4 and kBKMajor
-        and BLOCK_M == 192 and BLOCK_N == 128 and BLOCK_K == 256 and kGranKA == 32 and kGranKB == 32
-        and kNumStages == 2 and kNumTMAThreads == 128 and kNumMathThreads == 256 and kNumSMs == 48 and kEpiSubM == 32;
-    static constexpr uint32_t kNumSFAStagesPerLoad = kUseG2BK256Scale2 ? 1 : (4 * kGranKA) / BLOCK_K;
-    static constexpr uint32_t kNumSFBStagesPerLoad = kUseG2BK256Scale2 ? 1 : (4 * kGranKB) / BLOCK_K;
-    static constexpr uint32_t kNumSFStageRows = kUseG2BK256Scale2 ? 2u : 1u;
+    static constexpr uint32_t kNumSFAStagesPerLoad = (4 * kGranKA) / BLOCK_K;
+    static constexpr uint32_t kNumSFBStagesPerLoad = (4 * kGranKB) / BLOCK_K;
 
     static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
     static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
@@ -87,10 +83,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr bool kUseNonFP4G1LegacyPath = is_m_grouped_contiguous(kGemmType) and
         not kIsFP4 and (not kBIsFP4 or kNumSMs != 48);
     static constexpr bool kUseG1LegacyPath = kUseG1PsumLegacyPath or kUseNonFP4G1LegacyPath;
+    static constexpr bool kUseG2KFCandidatePath = kGemmType == GemmType::MGroupedMasked and
+        kIsFP4 and not kBIsFP4 and kBKMajor and kNumSMs == 48;
 
-    // Cooperative warp layout: G1 psum keeps the legacy warp mapping; G2 masked
-    // uses the accepted N-heavy mapping from the 63% baseline.
-    static constexpr uint32_t kNWarps = kUseG1LegacyPath ? 2 : 4;
+    // Cooperative warp layout: G1 keeps the legacy split; G2 follows the KF
+    // BM192/BN128 candidate that uses two N warps.
+    static constexpr uint32_t kNWarps = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? 2 : 4;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -100,8 +98,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
-    static constexpr uint32_t kTMARegisters = kUseNonFP4G1LegacyPath ? 40 : 32;
-    static constexpr uint32_t kMMARegisters = kUseNonFP4G1LegacyPath ? 232 : (kUseG1PsumLegacyPath ? 216 : 232);
+    static constexpr uint32_t kTMARegisters = kUseNonFP4G1LegacyPath ? 40 : (kUseG2KFCandidatePath ? 24 : 32);
+    static constexpr uint32_t kMMARegisters = kUseNonFP4G1LegacyPath ? 232 : (kUseG1PsumLegacyPath ? 216 : (kUseG2KFCandidatePath ? 240 : 232));
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
@@ -123,12 +121,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t SMEM_A  = BLOCK_M * kSMEMKBytes;
     static constexpr uint32_t kSMEMBRowBytes = kBKMajor ? kSMEMKBytes : BLOCK_N;
     static constexpr uint32_t SMEM_B  = kBKMajor ? (BLOCK_N * kSMEMKBytes) : (BLOCK_K * BLOCK_N);
-    static constexpr uint32_t SMEM_SFA_ROW = math::constexpr_align(static_cast<uint32_t>(BLOCK_M * sizeof(int32_t)), 128u);
-    static constexpr uint32_t SMEM_SFB_ROW = math::constexpr_align(static_cast<uint32_t>(BLOCK_N * sizeof(int32_t)), 128u);
-    static constexpr uint32_t SMEM_SFA = SMEM_SFA_ROW * kNumSFStageRows;
-    static constexpr uint32_t SMEM_SFB = SMEM_SFB_ROW * kNumSFStageRows;
-    static constexpr uint32_t TMA_SFA_BYTES = BLOCK_M * sizeof(int32_t) * kNumSFStageRows;
-    static constexpr uint32_t TMA_SFB_BYTES = BLOCK_N * sizeof(int32_t) * kNumSFStageRows;
+    static constexpr uint32_t SMEM_SFA = math::constexpr_align(static_cast<uint32_t>(BLOCK_M * sizeof(int32_t)), 128u);
+    static constexpr uint32_t SMEM_SFB = math::constexpr_align(static_cast<uint32_t>(BLOCK_N * sizeof(int32_t)), 128u);
+    static constexpr uint32_t TMA_SFA_BYTES = BLOCK_M * sizeof(int32_t);
+    static constexpr uint32_t TMA_SFB_BYTES = BLOCK_N * sizeof(int32_t);
     // TMA mbarrier reports GMEM bytes. For .b4x16_p64 (kBIsFP4): GMEM = SMEM/2 (packed).
     // For packed FP4 (kIsFP4): SMEM already uses packed size, so SMEM_B = GMEM bytes.
     static constexpr uint32_t TMA_B_BYTES = kBIsFP4 ? (SMEM_B / 2) : SMEM_B;
@@ -300,14 +296,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfa_k = scheduler.current_sf_k_cumsum + kb / kNumSFAStagesPerLoad;
                         sfb_k = scheduler.current_sf_k_cumsum + kb / kNumSFBStagesPerLoad;
                     } else {
-                        const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad / kNumSFStageRows);
-                        const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad / kNumSFStageRows);
+                        const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad);
+                        const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad);
                         constexpr bool kSFAGroupOffset = not is_m_grouped_contiguous(kGemmType);
                         sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched::IndexType::SF_K>(
-                            shape_sfa_k, 1, (kb / kNumSFAStagesPerLoad) * kNumSFStageRows, m_block_idx);
+                            shape_sfa_k, 1, kb / kNumSFAStagesPerLoad, m_block_idx);
                         constexpr bool kSFBGroupOffset = not (kGemmType == GemmType::Normal);
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
-                            shape_sfb_k, 1, (kb / kNumSFBStagesPerLoad) * kNumSFStageRows, m_block_idx);
+                            shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
                     if constexpr (kUseG1LegacyPath) {
                         tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
@@ -321,18 +317,26 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 n_idx, k_idx, 1, batch_idx);
                         }
                     } else {
-                        if constexpr (kBKMajor) {
-                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        if constexpr (kUseG2KFCandidatePath) {
+                            tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                            tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                            if constexpr (kBKMajor) {
+                                tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                            } else {
+                                tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                    tma_b_desc, full_barriers[s], smem_b[s],
+                                    n_idx, k_idx, 1, batch_idx);
+                            }
                         } else {
-                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                                tma_b_desc, full_barriers[s], smem_b[s],
-                                n_idx, k_idx, 1, batch_idx);
-                        }
-                        tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                        if constexpr (kUseG2BK256Scale2) {
-                            tma::copy<BLOCK_N, kNumSFStageRows, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                            tma::copy<BLOCK_M, kNumSFStageRows, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                        } else {
+                            if constexpr (kBKMajor) {
+                                tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                            } else {
+                                tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                    tma_b_desc, full_barriers[s], smem_b[s],
+                                    n_idx, k_idx, 1, batch_idx);
+                            }
+                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
                             tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
                             tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
                         }
@@ -351,13 +355,28 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = kUseG1LegacyPath ? (math_warp_idx / kNWarps) : (math_warp_idx % kMWarps);
-        const uint32_t warp_n = kUseG1LegacyPath ? (math_warp_idx % kNWarps) : (math_warp_idx / kMWarps);
+        const uint32_t warp_m = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? (math_warp_idx / kNWarps) : (math_warp_idx % kMWarps);
+        const uint32_t warp_n = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? (math_warp_idx % kNWarps) : (math_warp_idx / kMWarps);
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
         float accum[kAccumPerWarp];
         uint32_t iter_idx = 0;
+
+        sm120::SwizzleContext<kSwizzleAMode> hoisted_a_ctx[kMTilesPerWarp];
+        #pragma unroll
+        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+            int a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + (m_tile_base + mt) * 16;
+            hoisted_a_ctx[mt].init(a_row, kSMEMKBytes);
+        }
+        sm120::SwizzleContext<kSwizzleBMode> hoisted_b_ctx[kBKMajor ? kNTilesPerWarp : 1];
+        if constexpr (kBKMajor) {
+            #pragma unroll
+            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                int b_row = (lane_idx & 7) + (n_tile_base + nt) * 8;
+                hoisted_b_ctx[nt].init(b_row, kSMEMKBytes);
+            }
+        }
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
@@ -372,31 +391,18 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 full_barriers[stage]->wait(phase);
 
-                // Pre-compute swizzle contexts (row stride = kSMEMKBytes for packed FP4)
-                sm120::SwizzleContext<kSwizzleAMode> a_ctx[kMTilesPerWarp];
-                #pragma unroll
-                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
-                    int a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + (m_tile_base + mt) * 16;
-                    a_ctx[mt].init(a_row, kSMEMKBytes);
-                }
+                auto& a_ctx = hoisted_a_ctx;
                 // Per-N-tile x4 B load: one ldmatrix.x4 per N-tile covers 2 K-steps.
                 // Output {r0,r1} = K-step 0, {r2,r3} = K-step 1 — consecutive regs, zero MOV.
-                static constexpr bool kUsePerNTileX4 = kUseG1LegacyPath
-                    ? (kBKMajor and not kBIsFP4 and (kKSteps >= 2))
-                    : false;
+                static constexpr bool kUsePerNTileX4 = (kUseG1LegacyPath or kUseG2KFCandidatePath) and
+                    kBKMajor and not kBIsFP4 and (kKSteps >= 2);
 
                 using sf_t = cute::conditional_t<kIsFP4, uint16_t, uint8_t>;
                 const uint32_t sf_byte_a_base = (kb * BLOCK_K / kGranKA) % 4;
                 const uint32_t sf_byte_b_base = (kb * BLOCK_K / kGranKB) % 4;
 
                 if constexpr (kUsePerNTileX4) {
-                    // B SwizzleContext: per N-tile within this warp's N-tile range
-                    sm120::SwizzleContext<kSwizzleBMode> b_ctx[kNTilesPerWarp];
-                    #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
-                        int b_row = (lane_idx & 7) + (n_tile_base + nt) * 8;
-                        b_ctx[nt].init(b_row, kSMEMKBytes);
-                    }
+                    auto& b_ctx = hoisted_b_ctx;
 
                     // B fragments: per N-tile within warp's range, 4 regs covering 2 K-steps
                     uint32_t b_nt[kNTilesPerWarp][4];
@@ -448,7 +454,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         constexpr bool kSFFastPath = kIsFP4
                             and (kGranKB <= 32) and (kGranKB < BLOCK_K)
                             and (kGranKA <= 32) and (kGranKA < BLOCK_K);
-                        if constexpr (kSFFastPath and not kUseG2BK256Scale2) {
+                        if constexpr (kSFFastPath) {
                             const uint32_t sf_step0 = kb * kKSteps + ks_base;
                             const uint32_t sf_byte_b0 = (sf_step0 * MMA_K / kGranKB) % 4;
                             const uint32_t sf_byte_b1 = ((sf_step0 + 1) * MMA_K / kGranKB) % 4;
@@ -577,14 +583,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 } else {
                     // Fallback: original K-step double-buffer (MN-major B, mixed FP8×FP4)
-                    sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBKMajor ? kNTilesPerWarp : 1];
-                    if constexpr (kBKMajor) {
-                        #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
-                            int b_row = (lane_idx & 7) + (n_tile_base + nt) * 8;
-                            b_ctx[nt].init(b_row, kSMEMKBytes);
-                        }
-                    }
+                    auto& b_ctx = hoisted_b_ctx;
                     uint32_t a_frag[2][kMTilesPerWarp][4];
                     uint32_t b_tile[2][kNTilesPerWarp][2];
                     sf_t sfa_bytes[2][kMTilesPerWarp];
@@ -619,11 +618,6 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
 
                     auto load_kstep = [&](int buf, uint32_t ks) {
-                        if constexpr (kUseG2BK256Scale2) {
-                            #pragma unroll
-                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                                sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
-                        }
                         if constexpr (kBKMajor) {
                             if constexpr (kBIsFP4) {
                                 #pragma unroll
@@ -663,23 +657,19 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 b_tile[buf][nt][1] = v[4] | (uint32_t(v[5]) << 8) | (uint32_t(v[6]) << 16) | (uint32_t(v[7]) << 24);
                             }
                         }
-                        if constexpr (not kUseG2BK256Scale2) {
-                            #pragma unroll
-                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                                sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
-                        }
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                            sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
 
                         if constexpr (kGranKA < BLOCK_K or kGranKB < BLOCK_K) {
                             const uint32_t sf_step = (kb * kKSteps + ks);
-                            const uint32_t sf_row_b = kUseG2BK256Scale2 ? (ks / 2) : 0;
-                            const uint32_t sf_row_a = kUseG2BK256Scale2 ? (ks / 2) : 0;
                             if constexpr (kIsFP4) {
                                 const uint32_t sf_byte_a = (sf_step * MMA_K / kGranKA) % 4;
                                 const uint32_t sf_byte_b = (sf_step * MMA_K / kGranKB) % 4;
                                 #pragma unroll
                                 for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                     auto packed = sm120::load_sf(
-                                        smem_sfb[stage] + sf_row_b * SMEM_SFB_ROW, (n_tile_base + nt) * MMA_N + group_id);
+                                        smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
                                     if constexpr (kGranKB <= 32)
                                         sfb_bytes[buf][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b);
                                     else {
@@ -689,7 +679,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 }
                                 #pragma unroll
                                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
-                                    auto packed = sm120::load_sf(smem_sfa[stage] + sf_row_a * SMEM_SFA_ROW,
+                                    auto packed = sm120::load_sf(smem_sfa[stage],
                                         (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8);
                                     if constexpr (kGranKA <= 32)
                                         sfa_bytes[buf][mt] = sm120_mma::extract_sf_pair(packed, sf_byte_a);
@@ -704,12 +694,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 #pragma unroll
                                 for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
                                     sfb_bytes[buf][nt] = sm120_mma::extract_sf_byte(
-                                        sm120::load_sf(smem_sfb[stage] + sf_row_b * SMEM_SFB_ROW,
+                                        sm120::load_sf(smem_sfb[stage],
                                             (n_tile_base + nt) * MMA_N + group_id), sf_byte_b);
                                 #pragma unroll
                                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
                                     sfa_bytes[buf][mt] = sm120_mma::extract_sf_byte(
-                                        sm120::load_sf(smem_sfa[stage] + sf_row_a * SMEM_SFA_ROW,
+                                        sm120::load_sf(smem_sfa[stage],
                                             (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8), sf_byte_a);
                             }
                         }
