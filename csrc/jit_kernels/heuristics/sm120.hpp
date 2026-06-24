@@ -16,13 +16,19 @@ struct SM120ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
-        // G1 psum-contiguous needs the legacy BM128/BN192 shape for correctness.
-        // G2 masked uses the accepted BM192/BN128 layout that reaches ~63%.
-        const bool use_g1_psum_layout = desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
-        const bool use_g2_bk256_scale2_indexfix = desc.gemm_type == GemmType::MGroupedMasked and
-            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
-        const int block_m = use_g1_psum_layout ? 128 : 192;
-        const int target_block_n = use_g1_psum_layout ? 192 : 128;
+        // G1 contiguous uses BM128. FP4xFP4 G1 uses BN192; non-FP4xFP4
+        // psum needs BN128 to keep at least 2 pipeline stages.
+        // The G2 BM192/BK256 path is only enabled for 48-SM GB10.
+        const bool is_g1_contiguous = desc.gemm_type == GemmType::MGroupedContiguous or
+            desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool is_g2_masked = desc.gemm_type == GemmType::MGroupedMasked;
+        const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
+        const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
+        const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
+        const bool use_g2_bk256_scale2_indexfix = use_g2_gb10_layout and
+            desc.kernel_type == KernelType::Kernel1D1D and is_fp4_fp4;
+        const int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
+        const int target_block_n = use_g1_fp4_layout ? 192 : 128;
         const int block_k = use_g2_bk256_scale2_indexfix ? 256 : (128 / elem_size);
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
@@ -41,7 +47,7 @@ struct SM120ArchSpec {
         for (int block_n : block_n_candidates) {
             if (block_n != target_block_n)
                 continue;
-            if (block_n > 192)
+            if (block_n > mn_major_b_max_n)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};

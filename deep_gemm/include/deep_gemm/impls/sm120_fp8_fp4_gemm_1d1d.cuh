@@ -84,10 +84,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
     static constexpr bool kUseG1PsumLegacyPath = (kGemmType == GemmType::MGroupedContiguousWithPsumLayout);
+    static constexpr bool kUseNonFP4G1LegacyPath = is_m_grouped_contiguous(kGemmType) and
+        not kIsFP4 and (not kBIsFP4 or kNumSMs != 48);
+    static constexpr bool kUseG1LegacyPath = kUseG1PsumLegacyPath or kUseNonFP4G1LegacyPath;
 
     // Cooperative warp layout: G1 psum keeps the legacy warp mapping; G2 masked
     // uses the accepted N-heavy mapping from the 63% baseline.
-    static constexpr uint32_t kNWarps = kUseG1PsumLegacyPath ? 2 : 4;
+    static constexpr uint32_t kNWarps = kUseG1LegacyPath ? 2 : 4;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -97,8 +100,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
-    static constexpr uint32_t kTMARegisters = 32;
-    static constexpr uint32_t kMMARegisters = kUseG1PsumLegacyPath ? 216 : 232;
+    static constexpr uint32_t kTMARegisters = kUseNonFP4G1LegacyPath ? 40 : 32;
+    static constexpr uint32_t kMMARegisters = kUseNonFP4G1LegacyPath ? 232 : (kUseG1PsumLegacyPath ? 216 : 232);
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
@@ -209,8 +212,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    static constexpr uint32_t kSchedulerGroup = kUseG1PsumLegacyPath ? 11 : 7;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment, kSchedulerGroup>(
+    static constexpr uint32_t kSchedulerGroup = kUseG1LegacyPath ? 11 : 7;
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, not kUseG1LegacyPath, kNumSMs, kSFKAlignment, kSchedulerGroup>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -306,7 +309,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, (kb / kNumSFBStagesPerLoad) * kNumSFStageRows, m_block_idx);
                     }
-                    if constexpr (kUseG1PsumLegacyPath) {
+                    if constexpr (kUseG1LegacyPath) {
                         tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
                         tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
                         tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
@@ -348,8 +351,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = kUseG1PsumLegacyPath ? (math_warp_idx / kNWarps) : (math_warp_idx % kMWarps);
-        const uint32_t warp_n = kUseG1PsumLegacyPath ? (math_warp_idx % kNWarps) : (math_warp_idx / kMWarps);
+        const uint32_t warp_m = kUseG1LegacyPath ? (math_warp_idx / kNWarps) : (math_warp_idx % kMWarps);
+        const uint32_t warp_n = kUseG1LegacyPath ? (math_warp_idx % kNWarps) : (math_warp_idx / kMWarps);
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
@@ -378,7 +381,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
                 // Per-N-tile x4 B load: one ldmatrix.x4 per N-tile covers 2 K-steps.
                 // Output {r0,r1} = K-step 0, {r2,r3} = K-step 1 — consecutive regs, zero MOV.
-                static constexpr bool kUsePerNTileX4 = kUseG1PsumLegacyPath
+                static constexpr bool kUsePerNTileX4 = kUseG1LegacyPath
                     ? (kBKMajor and not kBIsFP4 and (kKSteps >= 2))
                     : false;
 

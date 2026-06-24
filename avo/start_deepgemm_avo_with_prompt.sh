@@ -34,6 +34,7 @@ SESSION="${SESSION:-avo-deepgemm-g1g2}"
 LOG="${LOG:-${TARGET}/avo/avo-deepgemm-g1g2.log}"
 ENABLE_BACKGROUND_AGENT="${ENABLE_BACKGROUND_AGENT:-true}"
 BG_AGENT_LOGS="${BG_AGENT_LOGS:-true}"
+CREW_MODE="${CREW_MODE:-}"
 
 if [[ ! -x "${AVO_ENV}/bin/n3" ]]; then
   echo "n3 not found or not executable: ${AVO_ENV}/bin/n3" >&2
@@ -78,7 +79,7 @@ mkdir -p "$(dirname "${LOG}")"
 
 tmux new-session -d -s "${SESSION}" "
   cd \"${AVO_ROOT}\" &&
-  export SHELL=/bin/bash ENABLE_BACKGROUND_AGENT=\"${ENABLE_BACKGROUND_AGENT}\" BG_AGENT_LOGS=\"${BG_AGENT_LOGS}\" &&
+  export SHELL=/bin/bash ENABLE_BACKGROUND_AGENT=\"${ENABLE_BACKGROUND_AGENT}\" BG_AGENT_LOGS=\"${BG_AGENT_LOGS}\" CREW_MODE=\"${CREW_MODE}\" &&
   \"${AVO_ENV}/bin/n3\" --model \"${AVO_MODEL}\" --working-dir \"${TARGET}\"
 "
 
@@ -94,6 +95,7 @@ Target repo: ${TARGET}
 Prompt file: ${PROMPT_FILE}
 Model preset: ${AVO_MODEL_PRESET}
 Model: ${AVO_MODEL}
+Crew mode: ${CREW_MODE:-<unset>}
 Log file: ${LOG}
 
 Monitor:
