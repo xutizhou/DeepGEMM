@@ -16,8 +16,17 @@ struct SM120ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
-        // Experiment: BM=192 with BN=64 → 5 stages potential
-        const int block_m = 192;
+        // G1 contiguous uses BM128. FP4xFP4 G1 uses BN192; non-FP4xFP4
+        // psum needs BN128 to keep at least 2 pipeline stages.
+        // G2 masked on 48-SM GB10 uses the KF-selected BM192/BN128/BK128 path.
+        const bool is_g1_contiguous = desc.gemm_type == GemmType::MGroupedContiguous or
+            desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout;
+        const bool is_g2_masked = desc.gemm_type == GemmType::MGroupedMasked;
+        const bool is_fp4_fp4 = desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4;
+        const bool use_g1_fp4_layout = is_g1_contiguous and is_fp4_fp4;
+        const bool use_g2_gb10_layout = is_g2_masked and desc.num_sms == 48;
+        const int block_m = (is_g1_contiguous or (is_g2_masked and not use_g2_gb10_layout)) ? 128 : 192;
+        const int target_block_n = use_g1_fp4_layout ? 192 : 128;
         const int block_k = 128 / elem_size;
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
@@ -30,12 +39,14 @@ struct SM120ArchSpec {
         }
 
         // MN-major B: ldmatrix.trans.x2 handles multi-atom SMEM correctly
-        const int mn_major_b_max_n = 128;
+        const int mn_major_b_max_n = use_g2_gb10_layout ? 128 : 192;
 
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {
-            // For BM=192, use BN=128 (matches shape_n=4096 with no waste).
-            if (block_n != 128) continue;
+            if (block_n != target_block_n)
+                continue;
+            if (block_n > mn_major_b_max_n)
+                continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
             const auto storage_config = get_storage_config(desc, layout);
@@ -95,10 +106,7 @@ struct SM120ArchSpec {
         const auto swizzle_mode_cd = (c10::elementSize(desc.cd_dtype) <= 2) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
-        // Search candidate sub-tile sizes {64, 32}. Smaller sub-tiles free more
-        // SMEM for the load pipeline, which is a clear win for deep-K, masked
-        // grouped FP4 GEMM (K=4096) where TMA latency benefits from one or two
-        // extra stages. store_m must divide block_m and stay >= MMA_M.
+        // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
         constexpr int kNumMaxStages = 16;
         const int smem_barriers = kNumMaxStages * 8 * 2;
         const int per_stage = get_smem_per_stage(desc, layout);
@@ -107,15 +115,12 @@ struct SM120ArchSpec {
 
         int store_m = layout.block_m;
         int best_stages = stages_full;
-        if (swizzle_mode_cd > 0) {
-            // Expanded candidate set: include 48 (for BM=192 → 4 sub-stores
-            // instead of 6, matching BM=128 BN=128's sub-store count).
+        const bool use_g2_gb10_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48 and
+            desc.kernel_type == KernelType::Kernel1D1D and desc.a_dtype == kPackedFP4 and desc.b_dtype == kPackedFP4 and
+            layout.block_m == 192 and layout.block_n == 128;
+        if (use_g2_gb10_layout and swizzle_mode_cd > 0) {
             for (const int candidate : {96, 64, 48, 32, 24, 16}) {
-                if (layout.block_m <= candidate)
-                    continue;
-                if (layout.block_m % candidate != 0)
-                    continue;
-                if (candidate < 16)  // store_m must be >= MMA_M
+                if (layout.block_m <= candidate or layout.block_m % candidate != 0)
                     continue;
                 const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, candidate);
                 const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
@@ -123,6 +128,14 @@ struct SM120ArchSpec {
                     best_stages = stages_sub;
                     store_m = candidate;
                 }
+            }
+        } else {
+            constexpr int kSubTileM = 64;
+            if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM and layout.block_m % kSubTileM == 0) {
+                const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
+                const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
+                if (stages_sub > stages_full)
+                    store_m = kSubTileM;
             }
         }
 
@@ -198,8 +211,13 @@ struct SM120ArchSpec {
 
         // Empirical warp-spec MMA efficiency model.
         // A reuse = BN/8 (each A fragment reused across N-tiles).
+        // Cooperative layout: larger BN reduces epilogue overhead (fewer tiles) and
+        // increases compute per K-block (better TMA latency amortization).
         const double a_reuse = static_cast<double>(layout.block_n) / 8.0;
-        double mma_efficiency = 0.69 + 0.07 * std::min(1.0, (a_reuse - 8.0) / 8.0);
+        const bool use_g2_gb10_layout = desc.gemm_type == GemmType::MGroupedMasked and desc.num_sms == 48;
+        double mma_efficiency = use_g2_gb10_layout
+            ? 0.69 + 0.07 * std::min(1.0, (a_reuse - 8.0) / 8.0)
+            : 0.69 + 0.12 * std::min(1.0, (a_reuse - 4.0) / 12.0);
 
         const double peak_flops_per_ns = (desc.a_dtype == at::kBFloat16) ? 380000.0 : 762000.0;
         double block_ns = flops_per_block / (peak_flops_per_ns * mma_efficiency);
