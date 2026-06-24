@@ -79,16 +79,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
-    static constexpr bool kUseG1PsumLegacyPath = (kGemmType == GemmType::MGroupedContiguousWithPsumLayout);
-    static constexpr bool kUseNonFP4G1LegacyPath = is_m_grouped_contiguous(kGemmType) and
-        not kIsFP4 and (not kBIsFP4 or kNumSMs != 48);
-    static constexpr bool kUseG1LegacyPath = kUseG1PsumLegacyPath or kUseNonFP4G1LegacyPath;
-    static constexpr bool kUseG2KFCandidatePath = kGemmType == GemmType::MGroupedMasked and
-        kIsFP4 and not kBIsFP4 and kBKMajor and kNumSMs == 48;
-
-    // Cooperative warp layout: G1 keeps the legacy split; G2 follows the KF
-    // BM192/BN128 candidate that uses two N warps.
-    static constexpr uint32_t kNWarps = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? 2 : 4;
+    // Cooperative warp layout: warps split across M and N dimensions
+    static constexpr uint32_t kNWarps = 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -98,8 +90,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
 
-    static constexpr uint32_t kTMARegisters = kUseNonFP4G1LegacyPath ? 40 : (kUseG2KFCandidatePath ? 24 : 32);
-    static constexpr uint32_t kMMARegisters = kUseNonFP4G1LegacyPath ? 232 : (kUseG1PsumLegacyPath ? 216 : (kUseG2KFCandidatePath ? 240 : 232));
+    // TUNING: Tighter register split — TMA threads do almost nothing for
+    // MGroupedMasked (only 1 thread issues TMAs), so drop them to the minimum
+    // (24) and give the MMA warps an extra 8 regs each.
+    static constexpr uint32_t kTMARegisters = 24;
+    static constexpr uint32_t kMMARegisters = 240;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
@@ -208,8 +203,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    static constexpr uint32_t kSchedulerGroup = kUseG1LegacyPath ? 11 : 7;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, not kUseG1LegacyPath, kNumSMs, kSFKAlignment, kSchedulerGroup>(
+    // V13: just N-major scheduler (no SF hoist) — isolate scheduler contribution
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, true, kNumSMs, kSFKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -305,41 +300,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
-                    if constexpr (kUseG1LegacyPath) {
-                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                        tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                        tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                        if constexpr (kBKMajor) {
-                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                        } else {
-                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                                tma_b_desc, full_barriers[s], smem_b[s],
-                                n_idx, k_idx, 1, batch_idx);
-                        }
+                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                    if constexpr (kBKMajor) {
+                        tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
                     } else {
-                        if constexpr (kUseG2KFCandidatePath) {
-                            tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                            tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                            if constexpr (kBKMajor) {
-                                tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                            } else {
-                                tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                                    tma_b_desc, full_barriers[s], smem_b[s],
-                                    n_idx, k_idx, 1, batch_idx);
-                            }
-                        } else {
-                            if constexpr (kBKMajor) {
-                                tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                            } else {
-                                tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                                    tma_b_desc, full_barriers[s], smem_b[s],
-                                    n_idx, k_idx, 1, batch_idx);
-                            }
-                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                            tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                            tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                        }
+                        tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                            tma_b_desc, full_barriers[s], smem_b[s],
+                            n_idx, k_idx, 1, batch_idx);
                     }
                     full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                 }
@@ -355,14 +324,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t warp_m = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? (math_warp_idx / kNWarps) : (math_warp_idx % kMWarps);
-        const uint32_t warp_n = (kUseG1LegacyPath or kUseG2KFCandidatePath) ? (math_warp_idx % kNWarps) : (math_warp_idx / kMWarps);
+        const uint32_t warp_m = math_warp_idx / kNWarps;
+        const uint32_t warp_n = math_warp_idx % kNWarps;
         const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
         float accum[kAccumPerWarp];
         uint32_t iter_idx = 0;
 
+        // HOIST: SwizzleContext for A/B is loop-invariant (depends only on
+        // lane_idx, m_tile_base, n_tile_base which are per-warp constants).
+        // Pre-compute once outside both the persistent and K-block loops.
         sm120::SwizzleContext<kSwizzleAMode> hoisted_a_ctx[kMTilesPerWarp];
         #pragma unroll
         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
@@ -391,17 +363,18 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 full_barriers[stage]->wait(phase);
 
+                // Pre-computed swizzle contexts (hoisted out of K-block loop)
                 auto& a_ctx = hoisted_a_ctx;
                 // Per-N-tile x4 B load: one ldmatrix.x4 per N-tile covers 2 K-steps.
                 // Output {r0,r1} = K-step 0, {r2,r3} = K-step 1 — consecutive regs, zero MOV.
-                static constexpr bool kUsePerNTileX4 = (kUseG1LegacyPath or kUseG2KFCandidatePath) and
-                    kBKMajor and not kBIsFP4 and (kKSteps >= 2);
+                static constexpr bool kUsePerNTileX4 = kBKMajor and not kBIsFP4 and (kKSteps >= 2);
 
                 using sf_t = cute::conditional_t<kIsFP4, uint16_t, uint8_t>;
                 const uint32_t sf_byte_a_base = (kb * BLOCK_K / kGranKA) % 4;
                 const uint32_t sf_byte_b_base = (kb * BLOCK_K / kGranKB) % 4;
 
                 if constexpr (kUsePerNTileX4) {
+                    // B SwizzleContext: hoisted from K-block loop
                     auto& b_ctx = hoisted_b_ctx;
 
                     // B fragments: per N-tile within warp's range, 4 regs covering 2 K-steps
@@ -411,8 +384,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     // SF: hoisted values and per-step values
                     sf_t sfb_hoisted[kNTilesPerWarp];
                     sf_t sfa_hoisted[kMTilesPerWarp];
-                    // Iter14: double-buffer sfb_step so dual-byte extraction works
-                    sf_t sfb_step[2][kNTilesPerWarp];
+                    sf_t sfb_step[kNTilesPerWarp];
                     sf_t sfa_step[2][kMTilesPerWarp];
 
                     // SF hoist (per K-block, when gran_k >= BLOCK_K)
@@ -448,33 +420,6 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     for (uint32_t kp = 0; kp < kKStepPairs; ++kp) {
                         const uint32_t ks_base = kp * 2;
 
-                        // Iter14 (sf_pair_dual + early-SF): pre-load both SFA/SFB step
-                        // values from a single SMEM word per (n,m) tile when granularity
-                        // permits, BEFORE issuing A/B ldmatrix loads to overlap LSU.
-                        constexpr bool kSFFastPath = kIsFP4
-                            and (kGranKB <= 32) and (kGranKB < BLOCK_K)
-                            and (kGranKA <= 32) and (kGranKA < BLOCK_K);
-                        if constexpr (kSFFastPath) {
-                            const uint32_t sf_step0 = kb * kKSteps + ks_base;
-                            const uint32_t sf_byte_b0 = (sf_step0 * MMA_K / kGranKB) % 4;
-                            const uint32_t sf_byte_b1 = ((sf_step0 + 1) * MMA_K / kGranKB) % 4;
-                            const uint32_t sf_byte_a0 = (sf_step0 * MMA_K / kGranKA) % 4;
-                            const uint32_t sf_byte_a1 = ((sf_step0 + 1) * MMA_K / kGranKA) % 4;
-                            #pragma unroll
-                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
-                                auto packed = sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
-                                sfb_step[0][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b0);
-                                sfb_step[1][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b1);
-                            }
-                            #pragma unroll
-                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
-                                auto packed = sm120::load_sf(smem_sfa[stage],
-                                    (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8);
-                                sfa_step[0][mt] = sm120_mma::extract_sf_pair(packed, sf_byte_a0);
-                                sfa_step[1][mt] = sm120_mma::extract_sf_pair(packed, sf_byte_a1);
-                            }
-                        }
-
                         // Load A for ks_base (issued early for latency hiding)
                         #pragma unroll
                         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
@@ -497,10 +442,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                         for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                             auto packed = sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
                                             if constexpr (kGranKB <= 32)
-                                                sfb_step[sf_buf][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b);
+                                                sfb_step[nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b);
                                             else {
                                                 uint8_t b = sm120_mma::extract_sf_byte(packed, sf_byte_b);
-                                                sfb_step[sf_buf][nt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
+                                                sfb_step[nt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
                                             }
                                         }
                                     }
@@ -523,7 +468,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                     if constexpr (kGranKB < BLOCK_K) {
                                         #pragma unroll
                                         for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
-                                            sfb_step[sf_buf][nt] = sm120_mma::extract_sf_byte(
+                                            sfb_step[nt] = sm120_mma::extract_sf_byte(
                                                 sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id), sf_byte_b);
                                     }
                                     if constexpr (kGranKA < BLOCK_K) {
@@ -537,9 +482,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             }
                         };
 
-                        if constexpr (not kSFFastPath) {
-                            load_sf_for_step(ks_base, 0);
-                        }
+                        load_sf_for_step(ks_base, 0);
 
                         // Prefetch A for ks_base+1
                         #pragma unroll
@@ -553,7 +496,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
-                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_step[0][nt];
+                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_step[nt];
                                 if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[0][mt], b_nt[nt][0], b_nt[nt][1], sfa0, sfb);
                                 else
@@ -561,10 +504,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             }
                         }
 
-                        // Load SF for ks_base+1 (only if not pre-filled)
-                        if constexpr (not kSFFastPath) {
-                            load_sf_for_step(ks_base + 1, 1);
-                        }
+                        // Load SF for ks_base+1 (if not hoisted)
+                        load_sf_for_step(ks_base + 1, 1);
 
                         // K-step 1: MMA with b_nt[nt]{2,3} (consecutive regs)
                         #pragma unroll
@@ -573,7 +514,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
-                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_step[1][nt];
+                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_step[nt];
                                 if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[1][mt], b_nt[nt][2], b_nt[nt][3], sfa1, sfb);
                                 else
@@ -668,8 +609,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 const uint32_t sf_byte_b = (sf_step * MMA_K / kGranKB) % 4;
                                 #pragma unroll
                                 for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
-                                    auto packed = sm120::load_sf(
-                                        smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
+                                    auto packed = sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
                                     if constexpr (kGranKB <= 32)
                                         sfb_bytes[buf][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b);
                                     else {
@@ -694,8 +634,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 #pragma unroll
                                 for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
                                     sfb_bytes[buf][nt] = sm120_mma::extract_sf_byte(
-                                        sm120::load_sf(smem_sfb[stage],
-                                            (n_tile_base + nt) * MMA_N + group_id), sf_byte_b);
+                                        sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id), sf_byte_b);
                                 #pragma unroll
                                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
                                     sfa_bytes[buf][mt] = sm120_mma::extract_sf_byte(
